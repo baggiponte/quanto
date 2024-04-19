@@ -15,6 +15,7 @@ import pytest
 import torch
 
 from pack_intweight import pack_intweight
+from quanto import AffineQuantizer, MaxOptimizer, qint4, ungroup
 from ext import *
 
 
@@ -85,3 +86,51 @@ def test_standalone_kernel(in_features, out_features, kernel):
     pt_outputs = torch.matmul(inputs, other_t)
     # Verify the results are similar
     assert_similar(awq_outputs, pt_outputs, rtol=5e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("in_features, out_features", [(256, 256), (512, 256)])
+@pytest.mark.parametrize("kernel", ["gemm", "gemv"])
+def test_integrated_kernel(in_features, out_features, kernel):
+    group_size = 128 # Hard-coded in kernels
+    interleave = 4 # Hard-coded in kernels
+    kstride = 64 # Hard-coded in kernels
+    device = torch.device('cuda')
+    batch_size, tokens = (4, 1) if kernel == "gemv" else (10, 128)
+    input_shape = (batch_size, tokens, in_features)
+    inputs = torch.rand(input_shape, dtype=torch.float16, device=device) * 2 - 1
+    other_shape = (out_features, in_features)
+    other = torch.rand(other_shape, dtype=torch.float16, device=device) * 2 - 1
+    # Quantize using quanto
+    scale, zeropoint = MaxOptimizer()(other, bits=4, axis=0, group_size=128)
+    quanto_base = AffineQuantizer.apply(other, qint4, 0, group_size, scale, zeropoint)
+    # Evaluate mm
+    quanto_outputs = torch.matmul(inputs, quanto_base.t())
+
+    # Extract quantized data, unpack and ungroup to recover original shape
+    quanto_data = ungroup(quanto_base._data.unpack(), axis=0, orig_shape=other_shape)
+    # Pack data for AWQ kernel
+    awq_data = pack_intweight(quanto_data.to(torch.int32), interleave=interleave, kstride=kstride)
+    # Reshape and transpose scale as expected by AWQ kernel
+    awq_scale = scale.reshape(out_features, in_features // group_size).t()
+    # Reshape and transpose zeropoint as expected by AWQ kernel
+    awq_zeropoint = zeropoint.reshape(out_features, in_features // group_size).t()
+    # Negate and rescale
+    awq_scaled_zeropoint = - awq_zeropoint * awq_scale
+
+    # Evaluate mm outputs using the AWQ kernels
+    if kernel == "gemv":
+        awq_outputs = torch.ops.awq.gemv(inputs,
+                                         awq_data,
+                                         awq_scale,
+                                         awq_scaled_zeropoint,
+                                         m=inputs.numel() // inputs.shape[-1],
+                                         n=out_features,
+                                         k=in_features,
+                                         group_size=group_size)
+    else:
+        awq_outputs = torch.ops.awq.gemm(inputs, awq_data, awq_scale, awq_scaled_zeropoint)
+
+    # Verify the results are similar
+    # FIXME: the error is actually quite important
+    assert_similar(awq_outputs, quanto_outputs, rtol=2e-2)
